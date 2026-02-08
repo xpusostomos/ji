@@ -1,8 +1,25 @@
-(module srfi-170 (open-directory read-directory-entry read-directory close-directory dirent-name dirent-ino make-directory-files-generator directory-files real-path posix-error? posix-error-name posix-error-number)
+(module srfi-170 (
+				  create-directory
+				  create-fifo
+				  create-hard-link
+				  create-symlink
+				  read-symlink
+				  open-directory
+				  read-directory-entry
+				  read-directory
+				  close-directory
+				  dirent-name
+				  dirent-ino
+				  make-directory-files-generator
+				  directory-files
+				  real-path
+				  posix-error?
+				  posix-error-name
+				  posix-error-number)
   (import scheme)
   (import srfi-13)
   (import srfi-121)
-  (import (chicken file posix))
+;  (import (chicken file posix))
   (import (chicken foreign))
   (import (chicken gc))
   (import (chicken pathname))
@@ -13,14 +30,69 @@
   
   (foreign-declare "#include <dirent.h>")
   (foreign-declare "#include <sys/types.h>")
+  (foreign-declare "#include <sys/stat.h>")
+  (foreign-declare "#include <sys/fcntl.h>")
   
   ;; Define DIR* type for readability
   (define-foreign-type DIR* (c-pointer "DIR"))
   (define-foreign-type dirent* (c-pointer "struct dirent"))
+  (define-foreign-type mode-t unsigned-int)
+
+  (define (create-directory fname #!optional (permission-bits #o775))
+	(let ((res ((foreign-lambda int "mkdir" c-string mode-t) fname permission-bits)))
+	  (if (< res 0)
+		  (raise-posix-error 'create-directory fname))))
+	  
+  (define (create-fifo fname #!optional (permission-bits #o664))
+	(let ((res ((foreign-lambda int "mkfifo" c-string mode-t) fname permission-bits)))
+	  (if (< res 0)
+		  (raise-posix-error 'create-fifo fname))))
+
+  (define (create-hard-link old-fname new-fname)
+	(let ((res ((foreign-lambda int "link" c-string c-string) old-fname new-fname)))
+	  (if (< res 0)
+		  (raise-posix-error 'create-hard-link old-fname new-fname))))
+
+  (define (create-symlink old-fname new-fname)
+	(let ((res ((foreign-lambda int "symlink" c-string c-string) old-fname new-fname)))
+	  (if (< res 0)
+		  (raise-posix-error 'create-symlink old-fname new-fname))))
+
+  (define (read-symlink path)
+	(let* ((c-readlink
+			(foreign-lambda* c-string* ((c-string path))
+			  "
+    size_t sz = 1024;
+    char * buf = malloc(sz+1);
+    if (!buf) C_return(NULL);
+    ssize_t len = readlink(path, buf, sz+1);
+    while (len > (ssize_t)sz) {
+       sz *= 2;
+       char * tmp = realloc(buf, sz+1);
+       if (!tmp) {
+           free(buf);
+           C_return(NULL);
+       }
+       buf = tmp;
+       len = readlink(path, buf, sz+1);
+    }
+    if (0 <= len) {
+       buf[len] = '\\0'; // readlink does not append a null byte
+       C_return(buf);
+    }
+    free(buf);
+    C_return(NULL);
+       "))
+		   (ptr (c-readlink path)))
+	  (if ptr
+		  ptr
+		  (raise-posix-error 'read-symlink path))))
 
   (define (open-directory dir)
 	(let ((directory-object ((foreign-lambda DIR* "opendir" c-string) dir)))
-	  (if directory-object (set-finalizer! directory-object close-directory))
+	  (if directory-object
+		  (set-finalizer! directory-object close-directory)
+		  (raise-posix-error 'open-directory dir))
 	  directory-object))
 
 
@@ -110,7 +182,7 @@
 ;; Define the function that calls C and frees the memory
 (define (real-path path)
   (let* ((c-realpath (foreign-lambda c-pointer "realpath" c-string (c-pointer char)))
-		 (c-pointer->string (foreign-lambda* c-string ((c-pointer p))
+		 (c-pointer->string (foreign-lambda* c-pointer ((c-pointer p))
 							  "C_return((char *)p);"))
 		 (c-free (foreign-lambda void "free" c-pointer))
 		 (ptr (c-realpath path #f)))
