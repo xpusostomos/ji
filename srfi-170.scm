@@ -181,16 +181,11 @@
   
 ;; Define the function that calls C and frees the memory
 (define (real-path path)
-  (let* ((c-realpath (foreign-lambda c-pointer "realpath" c-string (c-pointer char)))
-		 (c-pointer->string (foreign-lambda* c-pointer ((c-pointer p))
-							  "C_return((char *)p);"))
-		 (c-free (foreign-lambda void "free" c-pointer))
+  (let* ((c-realpath (foreign-lambda c-string* "realpath" c-string c-pointer))
 		 (ptr (c-realpath path #f)))
-    (if (not ptr)
-        (raise-posix-error 'real-path path)
-		(let ((result (c-pointer->string ptr)))
-		  (c-free ptr)
-		  result))))
+    (if ptr
+		ptr
+        (raise-posix-error 'real-path path))))
 	  
   )
 
