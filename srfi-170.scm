@@ -19,17 +19,21 @@
 				  posix-error-message
 				  posix-error-procedure
 				  posix-error-arguments
-										;				  make-time
-										;binary-input
-										; textual-input
-				  ;binary-output
-										;textual-output
-										;binary-input/output
-										;buffer-none
-										;buffer-block
-										; buffer-line
-										;				  open-file
-										; fd->port
+				  binary-input
+				  textual-input
+				  binary-output
+				  textual-output
+				  binary-input/output
+				  buffer-none
+				  buffer-block
+				  buffer-line
+				  open/create
+				  open/exclusive 
+				  open/truncate
+				  open/append 
+				  open/no-follow							
+				  open-file
+				  fd->port
 				  create-directory
 				  create-fifo
 				  create-hard-link
@@ -124,8 +128,7 @@
   (import srfi-13)
   (import (only srfi-19 make-time time-utc time-second time-nanosecond))
   (import srfi-121)
-  (import (only (chicken file posix) port->fileno))
-;  (import (only (chicken file) user-information))
+  (import (only (chicken file posix) port->fileno open-input-file* open-output-file*))
   (import (chicken foreign))
   (import (chicken gc))
   (import (chicken pathname))
@@ -185,40 +188,171 @@
 								 'errno err-num 
 								 'name err-name)))))
   
+;;; procedure: (posix-error? obj) -> boolean
+;;; This procedure returns #t if obj is a condition object that 
+;;; describes a POSIX error, and #f otherwise.
+;;; Note: This must handle the condition properties 'posix, 'name, 
+;;; and 'message as defined in the CHICKEN core.
   (define (posix-error? c)
 	((condition-predicate 'posix-error) c))
 
+;;; procedure: (posix-error-name obj) -> symbol
+  ;;; Returns the symbolic name (a symbol) of the POSIX error described 
+;;; by the condition object obj.
   (define (posix-error-name err)
 	(if (and (condition? err) 
 			 ((condition-predicate 'posix-error) err))
 		(get-condition-property err 'posix-error 'name)
 		(error "Object is not a posix-error condition" err)))
   
+;; procedure: (posix-error-number obj) -> number
+;;; Returns the errno of the POSIX error described 
+;;; by the condition object obj.
   (define (posix-error-number err)
 	(if (and (condition? err) 
 			 ((condition-predicate 'posix-error) err))
 		(get-condition-property err 'posix-error 'errno)
 		(error "Object is not a posix-error condition" err)))
 
+;;; procedure: (posix-error-message obj) -> string
+;;; Returns a human-readable string describing the POSIX error 
+;;; described by the condition object obj.
   (define (posix-error-message err)
 	(if (and (condition? err) 
 			 ((condition-predicate 'posix-error) err))
 		(get-condition-property err 'posix-error 'message)
 		(error "Object is not a posix-error condition" err)))
 
+;;; procedure: (posix-error-procedure obj) -> symbol
+;;; Returns a symbol from which api caused the error
+;;; described by the condition object obj.
   (define (posix-error-procedure err)
 	(if (and (condition? err) 
 			 ((condition-predicate 'posix-error) err))
 		(get-condition-property err 'posix-error 'location)
 		(error "Object is not a posix-error condition" err)))
 
+;;; procedure: (posix-error-arguments obj) -> list
+;;; Returns the arguments passed to the api which caused the error
+;;; described by the condition object obj.
   (define (posix-error-arguments err)
 	(if (and (condition? err) 
 			 ((condition-predicate 'posix-error) err))
 		(get-condition-property err 'posix-error 'arguments)
 		(error "Object is not a posix-error condition" err)))
 
+  (define binary-input    'binary-input)
+  (define binary-output   'binary-output)
+  (define textual-input   'textual-input)
+  (define textual-output  'textual-output)
+  (define binary-input/output    'binary-input/output)
+  
+  (define buffer-none     'none)
+  (define buffer-line     'line)
+  (define buffer-block    'block)
 
+  
+  ;; Open-time Flags
+  (define open/read        (foreign-value "O_RDONLY" int))
+  (define open/write       (foreign-value "O_WRONLY" int))
+  (define open/read-write  (foreign-value "O_RDWR"   int))
+  (define read-only  (foreign-value "O_RDONLY" int))
+  (define open/create     (foreign-value "O_CREAT"  int))
+  (define open/exclusive  (foreign-value "O_EXCL"   int))
+  (define open/truncate   (foreign-value "O_TRUNC"  int))
+  (define open/append     (foreign-value "O_APPEND" int))
+
+;; Optional/Platform-Dependent
+  (define open/no-follow  (cond-expand 
+							(windows 0) 
+							(else (foreign-value "O_NOFOLLOW" int))))
+
+  (cond-expand
+	(windows
+	 (foreign-declare "#include <fcntl.h>")
+	 (define-constant open/binary (foreign-value "_O_BINARY" int))
+	 (define-constant open/text   (foreign-value "_O_TEXT"   int))
+	 
+	 (define (fd-set-mode! fd port-type)
+       (let ((mode (cond
+					((or (eq? port-type textual-input) 
+                         (eq? port-type textual-output)) open/text)
+					((or (eq? port-type binary-input) 
+                         (eq? port-type binary-output)
+                         (eq? port-type binary-input/output)) open/binary)
+					(else (error 'fd-set-mode! "invalid port-type for mode setting" port-type)))))
+		 ((foreign-lambda int "_setmode" int int) fd mode))))
+	(else
+	 ;; Unix/Linux implementation
+	 (define-constant open/binary 0)
+	 (define-constant open/text   0)
+	 (define (fd-set-mode! fd port-type)
+       ;; Still validate the type even if we don't need to flip bits
+       (if (not (memq port-type (list binary-input binary-output 
+                                      textual-input textual-output 
+                                      binary-input/output)))
+           (error 'fd-set-mode! "invalid port-type" port-type)
+           #t))))
+
+  (define fcntl/get-flags (foreign-value "F_GETFL" int))
+  
+  (define (fd-get-flags fd)
+	(let ((res ((foreign-lambda int "fcntl" int int) fd fcntl/get-flags)))
+      (if (= res -1)
+          (error 'fd-get-flags "Could not get file descriptor flags" fd)
+          res)))
+
+;;; procedure: (fd->port fd port-type [buffer-mode]) -> port
+;;; Converts an integer file descriptor FD into a Scheme port. 
+;;; PORT-TYPE must be a symbol like 'textual-input.
+  (define (fd->port fd port-type #!optional (buffer-mode buffer-block))
+	(fd-set-mode! fd port-type)
+    (let* ((actual-flags (fd-get-flags fd))
+           (append?      (not (zero? (bitwise-and actual-flags open/append))))
+           (chicken-buffering (cond
+                               ((eq? buffer-mode buffer-none)  #:none)
+                               ((eq? buffer-mode buffer-line)  #:line)
+                               ((eq? buffer-mode buffer-block) #:full)
+                               (else (error 'fd->port "invalid buffer-mode" buffer-mode)))))
+      (let ((port (cond
+                   ((or (eq? port-type binary-input) (eq? port-type textual-input))
+					(open-input-file* fd))
+                   ((or (eq? port-type binary-output) (eq? port-type textual-output))
+					(if append? 
+						(open-output-file* fd #:append) 
+						(open-output-file* fd)))
+                   ((eq? port-type binary-input/output)
+					(make-bidirectional-port (open-input-file* fd) 
+                                             (if append? 
+                                                 (open-output-file* fd #:append) 
+                                                 (open-output-file* fd))))
+                   (else (error 'fd->port "invalid port-type" port-type)))))
+		(set-buffering-mode! port chicken-buffering)
+		port)))
+
+;;; procedure: (open-file fname port-type flags [permission-bits [buffer-mode]]) -> port
+;;; Opens the file FNAME and returns a port of PORT-TYPE. FLAGS is a bitwise 
+;;; OR of open/ constants.
+  (define (open-file fname port-type flags #!optional (permission-bits #o644) (buffer-mode buffer-block))
+	(let* ((access-mode (cond
+                         ((or (eq? port-type binary-input) 
+                              (eq? port-type textual-input)) open/read)
+                         ((or (eq? port-type binary-output) 
+                              (eq? port-type textual-output)) open/write)
+                         ((eq? port-type binary-input/output) open/read-write)
+                         (else (error 'open-file "invalid port-type" port-type))))
+           
+           (mode-flag (cond
+                       ((or (eq? port-type textual-input) 
+							(eq? port-type textual-output)) open/text)
+                       (else open/binary)))
+           
+           (final-flags (bitwise-ior flags access-mode mode-flag))
+           (fd ((foreign-lambda int "open" c-string int int) fname final-flags permission-bits)))
+      (if (= fd -1)
+          (raise-posix-error 'open-file fname port-type flags permission-bits buffer-mode)
+          (fd->port fd port-type buffer-mode))))
+  
   (foreign-declare "#include <dirent.h>")
   (foreign-declare "#include <sys/types.h>")
   (foreign-declare "#include <sys/stat.h>")
