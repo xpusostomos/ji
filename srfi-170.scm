@@ -66,8 +66,8 @@
 				  make-directory-files-generator
 				  open-directory
 				  read-directory-entry
-				  dirent-name
-				  dirent-ino
+				  dirent:name
+				  direct:ino
 				  read-directory
 				  close-directory
 				  real-path
@@ -84,9 +84,9 @@
 				  file-system-info:id
 				  file-system-info:name-max
 				  file-space
-										;temp-file-prefix
-										;				  create-temp-file
-										;				  call-with-temporary-filename
+				  temp-file-prefix
+				  create-temp-file
+				  call-with-temporary-filename
 				  umask
 				  set-umask!
 				  current-directory
@@ -131,6 +131,7 @@
   (import (chicken pathname))
   (import (chicken process-context))
   (import (chicken process-context posix))
+  (import (only (chicken file) delete-file))
   (import posix-groups)
   (import (chicken memory))
   (import (chicken port))
@@ -641,56 +642,72 @@
 				  (raise-posix-error 'user-supplementary-gids)
 				  (list-tabulate actual-count 
 								 (lambda (n) (get-gid-at-index buf n)))))))))
-    
+
+  (define-record-type <directory-object>
+	(make-directory-object ptr)
+	directory-object?
+	(ptr directory-object:ptr directory-object:ptr-set!))
+  
   (define (open-directory dir)
-	(let ((directory-object ((foreign-lambda DIR* "opendir" c-string) dir)))
-	  (if directory-object
-		  (set-finalizer! directory-object close-directory)
-		  (raise-posix-error 'open-directory dir))
-	  directory-object))
+	(let ((ptr ((foreign-lambda DIR* "opendir" c-string) dir)))
+	  (if ptr
+		  (let ((directory-object (make-directory-object ptr)))
+			(begin (set-finalizer! directory-object close-directory)
+				   directory-object))
+		  (raise-posix-error 'open-directory dir))))
   
   (define (read-directory-entry directory-object)
-	(let ((dirent ((foreign-lambda dirent* "readdir" DIR*) directory-object)))
-	  (if (not dirent)
-		  (begin
-			(close-directory directory-object)
-			#!eof)
-		  dirent)))
+	(let ((ptr (directory-object:ptr directory-object)))
+	  (if ptr
+		(let ((dirent ((foreign-lambda dirent* "readdir" DIR*) ptr)))
+		  (if (not dirent)
+			  (begin
+				(close-directory directory-object)
+				#!eof)
+			  dirent))
+		(raise-posix-error 'read-directory-entry directory-object))))
 
   (define (read-directory directory-object #!optional (dot-files? #f))
 	(let ((dirent (read-directory-entry directory-object)))
 	  (if (eof-object? dirent)
 		  #!eof
-		  (let ((name (dirent-name dirent)))
+		  (let ((name (dirent:name dirent)))
 			(if (not (or (string=? name ".")
 						 (string=? name "..")
 						 (and (not dot-files?)
-							   (string-prefix? "." name))))
+							  (char=? (string-ref name 0) #\.))))
 				name
 				(read-directory directory-object))))))
   
   (define (close-directory directory-object)
-	(if directory-object
-		((foreign-lambda int "closedir" DIR*) directory-object)))
-  
-  (define (dirent-name dirent)
+	(let ((ptr (directory-object:ptr directory-object)))
+	(when ptr
+      ;; Only call C closedir if we haven't already
+      ((foreign-lambda int "closedir" DIR*) ptr)
+      ;; Crucial: Tag the object as closed so the finalizer does nothing
+	  (directory-object:ptr-set! directory-object #f)
+      (set-finalizer! directory-object (lambda args (void))))))
+	
+  (define (dirent:name dirent)
 	(if (eof-object? dirent)
 		dirent
 		((foreign-lambda* c-string ((dirent* dirent))
 		  "C_return(dirent->d_name);") dirent)))
     
-  (define dirent-ino
+  (define direct:ino
 	(foreign-lambda* unsigned-long ((dirent* dirent))
       "C_return(dirent->d_ino);"))
 
   (define (make-directory-files-generator dir #!optional (dot-files? #f))
 	(let ((directory-object (open-directory dir)))
-	  (lambda ()
-		(read-directory directory-object dot-files?))))
-
+	  ;; extension to SRFI-170, you can pass 'close to the generator to quit early.
+	  (lambda (#!optional (msg #f))
+		(if (eq? msg 'close)
+			(close-directory directory-object)
+			(read-directory directory-object dot-files?)))))
+	
   (define (directory-files dir #!optional (dot-files? #f))
 	(generator->list (make-directory-files-generator dir dot-files?)))
-
 
   (foreign-declare "#include <sys/statvfs.h>")
   
@@ -775,6 +792,48 @@
   (define (file-space path-or-port)
 	(file-system-info:blocks-available (file-system-info path-or-port)))
 
+  (define temp-file-prefix
+	(let ((tmpdir (or (get-environment-variable "TMPDIR")
+                      (get-environment-variable "TMP")
+                      (get-environment-variable "TEMP")
+                      "/tmp")))
+      (string-append tmpdir "/" (number->string (pid)) "-")))
+
+  (foreign-declare "
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+")
+
+  (define %mkstemp!
+	(foreign-lambda* bool ((scheme-object s))
+      "char *template = (char *)C_data_pointer(s);
+     int fd = mkstemp(template);
+     if (fd == -1) C_return(0);
+     close(fd);
+     C_return(1);"))
+  
+  (define (create-temp-file #!optional (prefix temp-file-prefix))
+	;; We add a null character #\null to the end of the template
+	(let* ((template-str (string-append prefix "XXXXXX" "\x00"))
+           (buffer (string->blob template-str)))
+      (if (%mkstemp! buffer)
+          ;; After mutation, we convert back to string. 
+          ;; We use substring to strip that extra null byte we added.
+          (let ((result (blob->string buffer)))
+			(substring result 0 (- (string-length result) 1)))
+          (raise-posix-error 'create-temp-file prefix))))
+  
+  (define (call-with-temporary-filename maker #!optional (prefix temp-file-prefix) #!key (tries 10))
+	(let loop ((attempts tries))
+      (if (zero? attempts)
+		  (raise-posix-error 'call-with-temporary-filename maker temp-file-prefix)
+          (let ((temp-path (create-temp-file prefix)))
+			;; Immediately vacate the spot so maker can attempt to create it
+			(delete-file temp-path)
+			(or (condition-case (maker temp-path) (exn () #f))
+				(loop (- attempts 1)))))))
+  
   (define (file-system-info path-or-port)
   ;; statvfs struct size varies, so we ask C for the size
 	(let ((buf (make-blob (foreign-value "sizeof(struct timespec)" int))))
